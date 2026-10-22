@@ -1,0 +1,30 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "vmName": {
+      "value": "bigip-vm"
+    },
+    "adminUsername": {
+      "value": "azureuser"
+    },
+    "authenticationType": {
+      "value": "password"
+    },
+    "adminPasswordOrKey": {
+      "value": "CHANGE_ME_StrongPassword123!"
+    },
+    "vmSize": {
+      "value": "Standard_DS3_v2"
+    },
+    "imageOffer": {
+      "value": "f5-big-ip-byol"
+    },
+    "imageSku": {
+      "value": "f5-big-all-2slot-byol"
+    },
+    "restrictedSrcAddress": {
+      "value": "*"
+    }
+  }
+}

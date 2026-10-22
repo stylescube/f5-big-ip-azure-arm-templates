@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "deploymentPrefix": {
+      "value": "bigip-ha"
+    },
+    "adminUsername": {
+      "value": "azureuser"
+    },
+    "authenticationType": {
+      "value": "password"
+    },
+    "adminPasswordOrKey": {
+      "value": "CHANGE_ME_StrongPassword123!"
+    },
+    "vmSize": {
+      "value": "Standard_DS4_v2"
+    },
+    "imageOffer": {
+      "value": "f5-big-ip-byol"
+    },
+    "imageSku": {
+      "value": "f5-big-all-2slot-byol"
+    },
+    "internalLbPrivateIp": {
+      "value": "10.0.2.100"
+    },
+    "healthProbePort": {
+      "value": 40000
+    },
+    "restrictedSrcAddress": {
+      "value": "*"
+    }
+  }
+}

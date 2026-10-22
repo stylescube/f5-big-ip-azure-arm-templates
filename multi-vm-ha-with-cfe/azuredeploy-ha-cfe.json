@@ -1,0 +1,837 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "deploymentPrefix": {
+      "type": "string",
+      "defaultValue": "bigip-cfe",
+      "metadata": {
+        "description": "Prefix used for naming all resources in the HA F5 Cloud Failover Extension (CFE) deployment."
+      }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Azure region for all deployed resources."
+      }
+    },
+    "adminUsername": {
+      "type": "string",
+      "defaultValue": "azureuser",
+      "metadata": {
+        "description": "Administrator username for both BIG-IP VMs."
+      }
+    },
+    "authenticationType": {
+      "type": "string",
+      "defaultValue": "password",
+      "allowedValues": [
+        "sshPublicKey",
+        "password"
+      ],
+      "metadata": {
+        "description": "Type of authentication to use on the Virtual Machines."
+      }
+    },
+    "adminPasswordOrKey": {
+      "type": "securestring",
+      "metadata": {
+        "description": "SSH public key or password for the BIG-IP Virtual Machines."
+      }
+    },
+    "vmSize": {
+      "type": "string",
+      "defaultValue": "Standard_DS4_v2",
+      "metadata": {
+        "description": "Size of the BIG-IP Virtual Machines (must support at least 3 NICs)."
+      }
+    },
+    "imageOffer": {
+      "type": "string",
+      "defaultValue": "f5-big-ip-byol",
+      "allowedValues": [
+        "f5-big-ip-byol",
+        "f5-big-ip-best",
+        "f5-big-ip-good",
+        "f5-big-ip-better"
+      ],
+      "metadata": {
+        "description": "F5 BIG-IP Marketplace Offer."
+      }
+    },
+    "imageSku": {
+      "type": "string",
+      "defaultValue": "f5-big-all-2slot-byol",
+      "metadata": {
+        "description": "F5 BIG-IP Marketplace SKU."
+      }
+    },
+    "bigipVersion": {
+      "type": "string",
+      "defaultValue": "latest",
+      "metadata": {
+        "description": "F5 BIG-IP image version."
+      }
+    },
+    "cfeFailoverLabel": {
+      "type": "string",
+      "defaultValue": "bigip-ha-cfe-deployment",
+      "metadata": {
+        "description": "Value for the f5_cloud_failover_label tag used by CFE to discover NICs, Route Tables, and Storage."
+      }
+    },
+    "cfeVersion": {
+      "type": "string",
+      "defaultValue": "2.1.1",
+      "metadata": {
+        "description": "F5 Cloud Failover Extension (CFE) release version to install via CustomScript extension."
+      }
+    },
+    "installCfePackage": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Automatically download and install the F5 Cloud Failover Extension RPM on both BIG-IP VMs during deployment."
+      }
+    },
+    "vnetAddressPrefix": {
+      "type": "string",
+      "defaultValue": "10.0.0.0/16",
+      "metadata": {
+        "description": "Address space for the Virtual Network."
+      }
+    },
+    "mgmtSubnetPrefix": {
+      "type": "string",
+      "defaultValue": "10.0.0.0/24",
+      "metadata": {
+        "description": "Subnet prefix for the Management network (eth0)."
+      }
+    },
+    "externalSubnetPrefix": {
+      "type": "string",
+      "defaultValue": "10.0.1.0/24",
+      "metadata": {
+        "description": "Subnet prefix for the Public/External network (eth1)."
+      }
+    },
+    "internalSubnetPrefix": {
+      "type": "string",
+      "defaultValue": "10.0.2.0/24",
+      "metadata": {
+        "description": "Subnet prefix for the Internal/HA network (eth2)."
+      }
+    },
+    "floatingExternalVipPrivateIp": {
+      "type": "string",
+      "defaultValue": "10.0.1.100",
+      "metadata": {
+        "description": "Floating secondary private IP on eth1 that CFE moves between BIG-IP VM1 and VM2 on failover."
+      }
+    },
+    "cfeManagedRoutePrefix": {
+      "type": "string",
+      "defaultValue": "10.10.0.0/16",
+      "metadata": {
+        "description": "Address prefix in the CFE-managed Route Table whose nextHopIpAddress CFE fails over between BIG-IP internal NICs."
+      }
+    },
+    "restrictedSrcAddress": {
+      "type": "string",
+      "defaultValue": "*",
+      "metadata": {
+        "description": "Source IP/CIDR allowed to access Management SSH (22) and GUI (443) on eth0."
+      }
+    }
+  },
+  "variables": {
+    "vmCount": 2,
+    "vnetName": "[format('{0}-vnet', parameters('deploymentPrefix'))]",
+    "mgmtSubnetName": "mgmt-subnet",
+    "externalSubnetName": "external-subnet",
+    "internalSubnetName": "internal-subnet",
+    "mgmtNsgName": "[format('{0}-eth0-mgmt-nsg', parameters('deploymentPrefix'))]",
+    "externalNsgName": "[format('{0}-eth1-ext-nsg', parameters('deploymentPrefix'))]",
+    "internalNsgName": "[format('{0}-eth2-int-nsg', parameters('deploymentPrefix'))]",
+    "floatingVipPipName": "[format('{0}-eth1-floating-vip-pip', parameters('deploymentPrefix'))]",
+    "routeTableName": "[format('{0}-cfe-rt', parameters('deploymentPrefix'))]",
+    "avSetName": "[format('{0}-avset', parameters('deploymentPrefix'))]",
+    "managedIdentityName": "[format('{0}-cfe-identity', parameters('deploymentPrefix'))]",
+    "storageAccountName": "[toLower(format('f5cfe{0}', uniqueString(resourceGroup().id, parameters('deploymentPrefix'))))]",
+    "contributorRoleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b24988ac-6180-42a0-ab88-20f7382dd24c')]",
+    "storageBlobDataContributorRoleId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')]",
+    "mgmtStaticIps": [
+      "10.0.0.4",
+      "10.0.0.5"
+    ],
+    "extSelfStaticIps": [
+      "10.0.1.4",
+      "10.0.1.5"
+    ],
+    "intSelfStaticIps": [
+      "10.0.2.4",
+      "10.0.2.5"
+    ],
+    "cfeRpmName": "[format('f5-cloud-failover-{0}-0.0.1.noarch.rpm', parameters('cfeVersion'))]",
+    "cfeRpmUrl": "[format('https://github.com/F5Networks/f5-cloud-failover-extension/releases/download/v{0}/{1}', parameters('cfeVersion'), variables('cfeRpmName'))]",
+    "cfeInstallCmd": "[format('curl -s -L -o /var/config/rest/downloads/{0} {1} && bigstart status restnoded && sleep 15 && curl -s -k -u {2}:''{3}'' -X POST -H \"Content-Type: application/json\" -d \"{{\\\"operation\\\":\\\"INSTALL\\\",\\\"packageFilePath\\\":\\\"/var/config/rest/downloads/{0}\\\"}}\" https://localhost:443/mgmt/shared/iapp/package-management-tasks', variables('cfeRpmName'), variables('cfeRpmUrl'), parameters('adminUsername'), parameters('adminPasswordOrKey'))]",
+    "linuxConfiguration": {
+      "disablePasswordAuthentication": true,
+      "ssh": {
+        "publicKeys": [
+          {
+            "path": "[format('/home/{0}/.ssh/authorized_keys', parameters('adminUsername'))]",
+            "keyData": "[parameters('adminPasswordOrKey')]"
+          }
+        ]
+      }
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+      "apiVersion": "2023-01-31",
+      "name": "[variables('managedIdentityName')]",
+      "location": "[parameters('location')]"
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "name": "[guid(resourceGroup().id, variables('managedIdentityName'), 'Contributor')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName'))]"
+      ],
+      "properties": {
+        "roleDefinitionId": "[variables('contributorRoleDefinitionId')]",
+        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName'))).principalId]",
+        "principalType": "ServicePrincipal"
+      }
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "name": "[guid(resourceGroup().id, variables('managedIdentityName'), 'StorageBlobDataContributor')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName'))]"
+      ],
+      "properties": {
+        "roleDefinitionId": "[variables('storageBlobDataContributorRoleId')]",
+        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName'))).principalId]",
+        "principalType": "ServicePrincipal"
+      }
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts",
+      "apiVersion": "2023-01-01",
+      "name": "[variables('storageAccountName')]",
+      "location": "[parameters('location')]",
+      "tags": {
+        "f5_cloud_failover_label": "[parameters('cfeFailoverLabel')]"
+      },
+      "sku": {
+        "name": "Standard_LRS"
+      },
+      "kind": "StorageV2",
+      "properties": {
+        "minimumTlsVersion": "TLS1_2",
+        "supportsHttpsTrafficOnly": true
+      }
+    },
+    {
+      "type": "Microsoft.Compute/availabilitySets",
+      "apiVersion": "2023-07-01",
+      "name": "[variables('avSetName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Aligned"
+      },
+      "properties": {
+        "platformFaultDomainCount": 2,
+        "platformUpdateDomainCount": 2
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('mgmtNsgName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "securityRules": [
+          {
+            "name": "Allow-Mgmt-SSH",
+            "properties": {
+              "description": "Allow SSH to BIG-IP eth0 Management interfaces",
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "22",
+              "sourceAddressPrefix": "[parameters('restrictedSrcAddress')]",
+              "destinationAddressPrefix": "*",
+              "access": "Allow",
+              "priority": 100,
+              "direction": "Inbound"
+            }
+          },
+          {
+            "name": "Allow-Mgmt-HTTPS",
+            "properties": {
+              "description": "Allow HTTPS (443) to BIG-IP eth0 TMUI Management GUI / iControl REST",
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "443",
+              "sourceAddressPrefix": "[parameters('restrictedSrcAddress')]",
+              "destinationAddressPrefix": "*",
+              "access": "Allow",
+              "priority": 110,
+              "direction": "Inbound"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('externalNsgName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "securityRules": [
+          {
+            "name": "Allow-Public-HTTPS-VIP",
+            "properties": {
+              "description": "Allow inbound public HTTPS application traffic on eth1",
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "443",
+              "sourceAddressPrefix": "Internet",
+              "destinationAddressPrefix": "*",
+              "access": "Allow",
+              "priority": 100,
+              "direction": "Inbound"
+            }
+          },
+          {
+            "name": "Allow-Public-HTTP-VIP",
+            "properties": {
+              "description": "Allow inbound public HTTP application traffic on eth1",
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "80",
+              "sourceAddressPrefix": "Internet",
+              "destinationAddressPrefix": "*",
+              "access": "Allow",
+              "priority": 110,
+              "direction": "Inbound"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('internalNsgName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "securityRules": [
+          {
+            "name": "Allow-BIGIP-HA-ConfigSync",
+            "properties": {
+              "description": "Allow BIG-IP HA CMI ConfigSync and Device Trust on eth2 (TCP 4353, 443, 1026)",
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRanges": [
+                "4353",
+                "443",
+                "1026"
+              ],
+              "sourceAddressPrefix": "VirtualNetwork",
+              "destinationAddressPrefix": "VirtualNetwork",
+              "access": "Allow",
+              "priority": 100,
+              "direction": "Inbound"
+            }
+          },
+          {
+            "name": "Allow-BIGIP-HA-Heartbeat-UDP",
+            "properties": {
+              "description": "Allow BIG-IP HA network failover heartbeat on eth2 (UDP 1026)",
+              "protocol": "Udp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "1026",
+              "sourceAddressPrefix": "VirtualNetwork",
+              "destinationAddressPrefix": "VirtualNetwork",
+              "access": "Allow",
+              "priority": 110,
+              "direction": "Inbound"
+            }
+          },
+          {
+            "name": "Allow-Internal-VNet-Traffic",
+            "properties": {
+              "description": "Allow internal VNet traffic routed via CFE UDRs to eth2",
+              "protocol": "*",
+              "sourcePortRange": "*",
+              "destinationPortRange": "*",
+              "sourceAddressPrefix": "VirtualNetwork",
+              "destinationAddressPrefix": "*",
+              "access": "Allow",
+              "priority": 120,
+              "direction": "Inbound"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/routeTables",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('routeTableName')]",
+      "location": "[parameters('location')]",
+      "tags": {
+        "f5_cloud_failover_label": "[parameters('cfeFailoverLabel')]",
+        "f5_self_ips": "[format('{0},{1}', variables('intSelfStaticIps')[0], variables('intSelfStaticIps')[1])]"
+      },
+      "properties": {
+        "disableBgpRoutePropagation": false,
+        "routes": [
+          {
+            "name": "CFE-Managed-Internal-Route",
+            "properties": {
+              "addressPrefix": "[parameters('cfeManagedRoutePrefix')]",
+              "nextHopType": "VirtualAppliance",
+              "nextHopIpAddress": "[variables('intSelfStaticIps')[0]]"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/virtualNetworks",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('vnetName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('mgmtNsgName'))]",
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('externalNsgName'))]",
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('internalNsgName'))]",
+        "[resourceId('Microsoft.Network/routeTables', variables('routeTableName'))]"
+      ],
+      "properties": {
+        "addressSpace": {
+          "addressPrefixes": [
+            "[parameters('vnetAddressPrefix')]"
+          ]
+        },
+        "subnets": [
+          {
+            "name": "[variables('mgmtSubnetName')]",
+            "properties": {
+              "addressPrefix": "[parameters('mgmtSubnetPrefix')]",
+              "networkSecurityGroup": {
+                "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('mgmtNsgName'))]"
+              }
+            }
+          },
+          {
+            "name": "[variables('externalSubnetName')]",
+            "properties": {
+              "addressPrefix": "[parameters('externalSubnetPrefix')]",
+              "networkSecurityGroup": {
+                "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('externalNsgName'))]"
+              }
+            }
+          },
+          {
+            "name": "[variables('internalSubnetName')]",
+            "properties": {
+              "addressPrefix": "[parameters('internalSubnetPrefix')]",
+              "networkSecurityGroup": {
+                "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('internalNsgName'))]"
+              },
+              "routeTable": {
+                "id": "[resourceId('Microsoft.Network/routeTables', variables('routeTableName'))]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/publicIPAddresses",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('floatingVipPipName')]",
+      "location": "[parameters('location')]",
+      "tags": {
+        "f5_cloud_failover_label": "[parameters('cfeFailoverLabel')]"
+      },
+      "sku": {
+        "name": "Standard"
+      },
+      "properties": {
+        "publicIPAllocationMethod": "Static",
+        "dnsSettings": {
+          "domainNameLabel": "[toLower(format('{0}-vip-{1}', parameters('deploymentPrefix'), uniqueString(resourceGroup().id)))]"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Network/publicIPAddresses",
+      "apiVersion": "2023-05-01",
+      "name": "[format('{0}-vm{1}-eth0-mgmt-pip', parameters('deploymentPrefix'), add(copyIndex(), 1))]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard"
+      },
+      "copy": {
+        "name": "mgmtPipLoop",
+        "count": "[variables('vmCount')]"
+      },
+      "properties": {
+        "publicIPAllocationMethod": "Static",
+        "dnsSettings": {
+          "domainNameLabel": "[toLower(format('{0}-vm{1}-mgmt-{2}', parameters('deploymentPrefix'), add(copyIndex(), 1), uniqueString(resourceGroup().id)))]"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Network/publicIPAddresses",
+      "apiVersion": "2023-05-01",
+      "name": "[format('{0}-vm{1}-eth1-self-pip', parameters('deploymentPrefix'), add(copyIndex(), 1))]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard"
+      },
+      "copy": {
+        "name": "extSelfPipLoop",
+        "count": "[variables('vmCount')]"
+      },
+      "properties": {
+        "publicIPAllocationMethod": "Static"
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "2023-05-01",
+      "name": "[format('{0}-vm{1}-eth0-mgmt-nic', parameters('deploymentPrefix'), add(copyIndex(), 1))]",
+      "location": "[parameters('location')]",
+      "copy": {
+        "name": "mgmtNicLoop",
+        "count": "[variables('vmCount')]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]",
+        "[resourceId('Microsoft.Network/publicIPAddresses', format('{0}-vm{1}-eth0-mgmt-pip', parameters('deploymentPrefix'), add(copyIndex(), 1)))]",
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('mgmtNsgName'))]"
+      ],
+      "properties": {
+        "enableIPForwarding": false,
+        "networkSecurityGroup": {
+          "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('mgmtNsgName'))]"
+        },
+        "ipConfigurations": [
+          {
+            "name": "eth0-mgmt-ipconfig",
+            "properties": {
+              "primary": true,
+              "privateIPAllocationMethod": "Static",
+              "privateIPAddress": "[variables('mgmtStaticIps')[copyIndex()]]",
+              "publicIPAddress": {
+                "id": "[resourceId('Microsoft.Network/publicIPAddresses', format('{0}-vm{1}-eth0-mgmt-pip', parameters('deploymentPrefix'), add(copyIndex(), 1)))]"
+              },
+              "subnet": {
+                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), variables('mgmtSubnetName'))]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "2023-05-01",
+      "name": "[format('{0}-vm1-eth1-ext-nic', parameters('deploymentPrefix'))]",
+      "location": "[parameters('location')]",
+      "tags": {
+        "f5_cloud_failover_label": "[parameters('cfeFailoverLabel')]",
+        "f5_cloud_failover_nic_map": "external"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]",
+        "[resourceId('Microsoft.Network/publicIPAddresses', format('{0}-vm1-eth1-self-pip', parameters('deploymentPrefix')))]",
+        "[resourceId('Microsoft.Network/publicIPAddresses', variables('floatingVipPipName'))]",
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('externalNsgName'))]"
+      ],
+      "properties": {
+        "enableIPForwarding": true,
+        "networkSecurityGroup": {
+          "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('externalNsgName'))]"
+        },
+        "ipConfigurations": [
+          {
+            "name": "eth1-self-ipconfig",
+            "properties": {
+              "primary": true,
+              "privateIPAllocationMethod": "Static",
+              "privateIPAddress": "[variables('extSelfStaticIps')[0]]",
+              "publicIPAddress": {
+                "id": "[resourceId('Microsoft.Network/publicIPAddresses', format('{0}-vm1-eth1-self-pip', parameters('deploymentPrefix')))]"
+              },
+              "subnet": {
+                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), variables('externalSubnetName'))]"
+              }
+            }
+          },
+          {
+            "name": "eth1-floating-vip-ipconfig",
+            "properties": {
+              "primary": false,
+              "privateIPAllocationMethod": "Static",
+              "privateIPAddress": "[parameters('floatingExternalVipPrivateIp')]",
+              "publicIPAddress": {
+                "id": "[resourceId('Microsoft.Network/publicIPAddresses', variables('floatingVipPipName'))]"
+              },
+              "subnet": {
+                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), variables('externalSubnetName'))]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "2023-05-01",
+      "name": "[format('{0}-vm2-eth1-ext-nic', parameters('deploymentPrefix'))]",
+      "location": "[parameters('location')]",
+      "tags": {
+        "f5_cloud_failover_label": "[parameters('cfeFailoverLabel')]",
+        "f5_cloud_failover_nic_map": "external"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]",
+        "[resourceId('Microsoft.Network/publicIPAddresses', format('{0}-vm2-eth1-self-pip', parameters('deploymentPrefix')))]",
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('externalNsgName'))]"
+      ],
+      "properties": {
+        "enableIPForwarding": true,
+        "networkSecurityGroup": {
+          "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('externalNsgName'))]"
+        },
+        "ipConfigurations": [
+          {
+            "name": "eth1-self-ipconfig",
+            "properties": {
+              "primary": true,
+              "privateIPAllocationMethod": "Static",
+              "privateIPAddress": "[variables('extSelfStaticIps')[1]]",
+              "publicIPAddress": {
+                "id": "[resourceId('Microsoft.Network/publicIPAddresses', format('{0}-vm2-eth1-self-pip', parameters('deploymentPrefix')))]"
+              },
+              "subnet": {
+                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), variables('externalSubnetName'))]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "2023-05-01",
+      "name": "[format('{0}-vm{1}-eth2-int-nic', parameters('deploymentPrefix'), add(copyIndex(), 1))]",
+      "location": "[parameters('location')]",
+      "tags": {
+        "f5_cloud_failover_label": "[parameters('cfeFailoverLabel')]",
+        "f5_cloud_failover_nic_map": "internal"
+      },
+      "copy": {
+        "name": "intNicLoop",
+        "count": "[variables('vmCount')]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]",
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('internalNsgName'))]"
+      ],
+      "properties": {
+        "enableIPForwarding": true,
+        "networkSecurityGroup": {
+          "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('internalNsgName'))]"
+        },
+        "ipConfigurations": [
+          {
+            "name": "eth2-int-ipconfig",
+            "properties": {
+              "primary": true,
+              "privateIPAllocationMethod": "Static",
+              "privateIPAddress": "[variables('intSelfStaticIps')[copyIndex()]]",
+              "subnet": {
+                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), variables('internalSubnetName'))]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Compute/virtualMachines",
+      "apiVersion": "2023-07-01",
+      "name": "[format('{0}-vm{1}', parameters('deploymentPrefix'), add(copyIndex(), 1))]",
+      "location": "[parameters('location')]",
+      "copy": {
+        "name": "vmLoop",
+        "count": "[variables('vmCount')]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Compute/availabilitySets', variables('avSetName'))]",
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName'))]",
+        "[resourceId('Microsoft.Network/networkInterfaces', format('{0}-vm{1}-eth0-mgmt-nic', parameters('deploymentPrefix'), add(copyIndex(), 1)))]",
+        "[resourceId('Microsoft.Network/networkInterfaces', format('{0}-vm{1}-eth1-ext-nic', parameters('deploymentPrefix'), add(copyIndex(), 1)))]",
+        "[resourceId('Microsoft.Network/networkInterfaces', format('{0}-vm{1}-eth2-int-nic', parameters('deploymentPrefix'), add(copyIndex(), 1)))]"
+      ],
+      "identity": {
+        "type": "UserAssigned",
+        "userAssignedIdentities": {
+          "[format('{0}', resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName')))]": {}
+        }
+      },
+      "plan": {
+        "name": "[parameters('imageSku')]",
+        "publisher": "f5-networks",
+        "product": "[parameters('imageOffer')]"
+      },
+      "properties": {
+        "availabilitySet": {
+          "id": "[resourceId('Microsoft.Compute/availabilitySets', variables('avSetName'))]"
+        },
+        "hardwareProfile": {
+          "vmSize": "[parameters('vmSize')]"
+        },
+        "osProfile": {
+          "computerName": "[format('{0}-vm{1}', parameters('deploymentPrefix'), add(copyIndex(), 1))]",
+          "adminUsername": "[parameters('adminUsername')]",
+          "adminPassword": "[parameters('adminPasswordOrKey')]",
+          "linuxConfiguration": "[if(equals(parameters('authenticationType'), 'password'), null(), variables('linuxConfiguration'))]"
+        },
+        "storageProfile": {
+          "imageReference": {
+            "publisher": "f5-networks",
+            "offer": "[parameters('imageOffer')]",
+            "sku": "[parameters('imageSku')]",
+            "version": "[parameters('bigipVersion')]"
+          },
+          "osDisk": {
+            "createOption": "FromImage",
+            "managedDisk": {
+              "storageAccountType": "Premium_LRS"
+            }
+          }
+        },
+        "networkProfile": {
+          "networkInterfaces": [
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', format('{0}-vm{1}-eth0-mgmt-nic', parameters('deploymentPrefix'), add(copyIndex(), 1)))]",
+              "properties": {
+                "primary": true
+              }
+            },
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', format('{0}-vm{1}-eth1-ext-nic', parameters('deploymentPrefix'), add(copyIndex(), 1)))]",
+              "properties": {
+                "primary": false
+              }
+            },
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', format('{0}-vm{1}-eth2-int-nic', parameters('deploymentPrefix'), add(copyIndex(), 1)))]",
+              "properties": {
+                "primary": false
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "condition": "[and(parameters('installCfePackage'), equals(parameters('authenticationType'), 'password'))]",
+      "type": "Microsoft.Compute/virtualMachines/extensions",
+      "apiVersion": "2023-07-01",
+      "name": "[format('{0}-vm{1}/install-f5-cfe', parameters('deploymentPrefix'), add(copyIndex(), 1))]",
+      "location": "[parameters('location')]",
+      "copy": {
+        "name": "cfeExtLoop",
+        "count": "[variables('vmCount')]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Compute/virtualMachines', format('{0}-vm{1}', parameters('deploymentPrefix'), add(copyIndex(), 1)))]"
+      ],
+      "properties": {
+        "publisher": "Microsoft.Azure.Extensions",
+        "type": "CustomScript",
+        "typeHandlerVersion": "2.1",
+        "autoUpgradeMinorVersion": true,
+        "protectedSettings": {
+          "commandToExecute": "[variables('cfeInstallCmd')]"
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "floatingPublicVipIp": {
+      "type": "string",
+      "value": "[reference(variables('floatingVipPipName')).ipAddress]"
+    },
+    "floatingPublicVipFqdn": {
+      "type": "string",
+      "value": "[reference(variables('floatingVipPipName')).dnsSettings.fqdn]"
+    },
+    "floatingPrivateVipIp": {
+      "type": "string",
+      "value": "[parameters('floatingExternalVipPrivateIp')]"
+    },
+    "bigip1MgmtGuiUrl": {
+      "type": "string",
+      "value": "[format('https://{0}', reference(format('{0}-vm1-eth0-mgmt-pip', parameters('deploymentPrefix'))).dnsSettings.fqdn)]"
+    },
+    "bigip2MgmtGuiUrl": {
+      "type": "string",
+      "value": "[format('https://{0}', reference(format('{0}-vm2-eth0-mgmt-pip', parameters('deploymentPrefix'))).dnsSettings.fqdn)]"
+    },
+    "cfeStorageAccountName": {
+      "type": "string",
+      "value": "[variables('storageAccountName')]"
+    },
+    "cfePayloadJson": {
+      "type": "object",
+      "value": {
+        "class": "Cloud_Failover",
+        "environment": "azure",
+        "externalStorage": {
+          "scopingTags": {
+            "f5_cloud_failover_label": "[parameters('cfeFailoverLabel')]"
+          }
+        },
+        "failoverAddresses": {
+          "enabled": true,
+          "scopingTags": {
+            "f5_cloud_failover_label": "[parameters('cfeFailoverLabel')]"
+          }
+        },
+        "failoverRoutes": {
+          "enabled": true,
+          "scopingTags": {
+            "f5_cloud_failover_label": "[parameters('cfeFailoverLabel')]"
+          },
+          "scopingAddressRanges": [
+            {
+              "range": "[parameters('cfeManagedRoutePrefix')]"
+            }
+          ],
+          "defaultNextHopAddresses": {
+            "discoveryType": "static",
+            "items": "[variables('intSelfStaticIps')]"
+          }
+        }
+      }
+    }
+  }
+}
