@@ -1,0 +1,906 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "deploymentPrefix": {
+      "type": "string",
+      "defaultValue": "bigip-glb",
+      "metadata": {
+        "description": "Prefix used for naming all resources in the Global Load Balancer + HA BIG-IP deployment."
+      }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Regional Azure location for the BIG-IP VMs, VNet, NSGs, and Regional Load Balancers."
+      }
+    },
+    "globalLbLocation": {
+      "type": "string",
+      "defaultValue": "eastus",
+      "allowedValues": [
+        "eastus",
+        "eastus2",
+        "westus",
+        "westus2",
+        "centralus",
+        "northeurope",
+        "westeurope",
+        "southeastasia",
+        "eastasia",
+        "uksouth",
+        "australiaeast"
+      ],
+      "metadata": {
+        "description": "Home region for the Azure Cross-Region (Global Tier) Load Balancer and Global Public IP."
+      }
+    },
+    "adminUsername": {
+      "type": "string",
+      "defaultValue": "azureuser",
+      "metadata": {
+        "description": "Administrator username for both BIG-IP VMs."
+      }
+    },
+    "authenticationType": {
+      "type": "string",
+      "defaultValue": "password",
+      "allowedValues": [
+        "sshPublicKey",
+        "password"
+      ],
+      "metadata": {
+        "description": "Type of authentication to use on the Virtual Machines."
+      }
+    },
+    "adminPasswordOrKey": {
+      "type": "securestring",
+      "metadata": {
+        "description": "SSH public key or password for the BIG-IP Virtual Machines."
+      }
+    },
+    "vmSize": {
+      "type": "string",
+      "defaultValue": "Standard_DS4_v2",
+      "metadata": {
+        "description": "Size of the BIG-IP Virtual Machines (must support at least 3 NICs)."
+      }
+    },
+    "imageOffer": {
+      "type": "string",
+      "defaultValue": "f5-big-ip-byol",
+      "allowedValues": [
+        "f5-big-ip-byol",
+        "f5-big-ip-best",
+        "f5-big-ip-good",
+        "f5-big-ip-better"
+      ],
+      "metadata": {
+        "description": "F5 BIG-IP Marketplace Offer."
+      }
+    },
+    "imageSku": {
+      "type": "string",
+      "defaultValue": "f5-big-all-2slot-byol",
+      "metadata": {
+        "description": "F5 BIG-IP Marketplace SKU."
+      }
+    },
+    "bigipVersion": {
+      "type": "string",
+      "defaultValue": "latest",
+      "metadata": {
+        "description": "F5 BIG-IP image version."
+      }
+    },
+    "vnetAddressPrefix": {
+      "type": "string",
+      "defaultValue": "10.0.0.0/16",
+      "metadata": {
+        "description": "Address space for the Virtual Network."
+      }
+    },
+    "mgmtSubnetPrefix": {
+      "type": "string",
+      "defaultValue": "10.0.0.0/24",
+      "metadata": {
+        "description": "Subnet prefix for the Management network (eth0)."
+      }
+    },
+    "externalSubnetPrefix": {
+      "type": "string",
+      "defaultValue": "10.0.1.0/24",
+      "metadata": {
+        "description": "Subnet prefix for the Public/External network (eth1 & Regional External ALB)."
+      }
+    },
+    "internalSubnetPrefix": {
+      "type": "string",
+      "defaultValue": "10.0.2.0/24",
+      "metadata": {
+        "description": "Subnet prefix for the Internal/Trusted network (eth2 & Regional Internal ALB)."
+      }
+    },
+    "internalLbPrivateIp": {
+      "type": "string",
+      "defaultValue": "10.0.2.100",
+      "metadata": {
+        "description": "Static Private IP address for the Regional Internal Azure Load Balancer frontend."
+      }
+    },
+    "healthProbePort": {
+      "type": "int",
+      "defaultValue": 40000,
+      "metadata": {
+        "description": "TCP port used by the Regional Azure Load Balancers to probe BIG-IP health."
+      }
+    },
+    "restrictedSrcAddress": {
+      "type": "string",
+      "defaultValue": "*",
+      "metadata": {
+        "description": "Source IP/CIDR allowed to access Management SSH (22) and GUI (443) on eth0."
+      }
+    }
+  },
+  "variables": {
+    "vmCount": 2,
+    "vnetName": "[format('{0}-vnet', parameters('deploymentPrefix'))]",
+    "mgmtSubnetName": "mgmt-subnet",
+    "externalSubnetName": "external-subnet",
+    "internalSubnetName": "internal-subnet",
+    "mgmtNsgName": "[format('{0}-eth0-mgmt-nsg', parameters('deploymentPrefix'))]",
+    "externalNsgName": "[format('{0}-eth1-ext-nsg', parameters('deploymentPrefix'))]",
+    "internalNsgName": "[format('{0}-eth2-int-nsg', parameters('deploymentPrefix'))]",
+    "globalLbName": "[format('{0}-global-alb', parameters('deploymentPrefix'))]",
+    "globalLbPipName": "[format('{0}-global-pip', parameters('deploymentPrefix'))]",
+    "globalLbFrontendName": "GlobalFrontend",
+    "globalLbBackendPoolName": "GlobalRegionalAlbsPool",
+    "externalLbName": "[format('{0}-regional-ext-alb', parameters('deploymentPrefix'))]",
+    "externalLbPipName": "[format('{0}-regional-ext-pip', parameters('deploymentPrefix'))]",
+    "externalLbFrontendName": "RegionalExternalFrontend",
+    "externalLbBackendPoolName": "RegionalExternalBigIpPool",
+    "externalLbProbeName": "RegionalExternalBigIpProbe",
+    "internalLbName": "[format('{0}-regional-int-alb', parameters('deploymentPrefix'))]",
+    "internalLbFrontendName": "RegionalInternalFrontend",
+    "internalLbBackendPoolName": "RegionalInternalBigIpPool",
+    "internalLbProbeName": "RegionalInternalBigIpProbe",
+    "avSetName": "[format('{0}-avset', parameters('deploymentPrefix'))]",
+    "linuxConfiguration": {
+      "disablePasswordAuthentication": true,
+      "ssh": {
+        "publicKeys": [
+          {
+            "path": "[format('/home/{0}/.ssh/authorized_keys', parameters('adminUsername'))]",
+            "keyData": "[parameters('adminPasswordOrKey')]"
+          }
+        ]
+      }
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Compute/availabilitySets",
+      "apiVersion": "2023-07-01",
+      "name": "[variables('avSetName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Aligned"
+      },
+      "properties": {
+        "platformFaultDomainCount": 2,
+        "platformUpdateDomainCount": 2
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('mgmtNsgName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "securityRules": [
+          {
+            "name": "Allow-Mgmt-SSH",
+            "properties": {
+              "description": "Allow SSH to BIG-IP eth0 Management interfaces",
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "22",
+              "sourceAddressPrefix": "[parameters('restrictedSrcAddress')]",
+              "destinationAddressPrefix": "*",
+              "access": "Allow",
+              "priority": 100,
+              "direction": "Inbound"
+            }
+          },
+          {
+            "name": "Allow-Mgmt-HTTPS",
+            "properties": {
+              "description": "Allow HTTPS (443) to BIG-IP eth0 TMUI Management GUI / iControl REST",
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "443",
+              "sourceAddressPrefix": "[parameters('restrictedSrcAddress')]",
+              "destinationAddressPrefix": "*",
+              "access": "Allow",
+              "priority": 110,
+              "direction": "Inbound"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('externalNsgName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "securityRules": [
+          {
+            "name": "Allow-External-HTTPS",
+            "properties": {
+              "description": "Allow inbound public HTTPS traffic on eth1 from Global/Regional Load Balancers",
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "443",
+              "sourceAddressPrefix": "Internet",
+              "destinationAddressPrefix": "*",
+              "access": "Allow",
+              "priority": 100,
+              "direction": "Inbound"
+            }
+          },
+          {
+            "name": "Allow-External-HTTP",
+            "properties": {
+              "description": "Allow inbound public HTTP traffic on eth1 from Global/Regional Load Balancers",
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "80",
+              "sourceAddressPrefix": "Internet",
+              "destinationAddressPrefix": "*",
+              "access": "Allow",
+              "priority": 110,
+              "direction": "Inbound"
+            }
+          },
+          {
+            "name": "Allow-AzureLoadBalancer-Probes",
+            "properties": {
+              "description": "Allow Azure Load Balancer health probes on eth1",
+              "protocol": "*",
+              "sourcePortRange": "*",
+              "destinationPortRange": "*",
+              "sourceAddressPrefix": "AzureLoadBalancer",
+              "destinationAddressPrefix": "*",
+              "access": "Allow",
+              "priority": 120,
+              "direction": "Inbound"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('internalNsgName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "securityRules": [
+          {
+            "name": "Allow-BIGIP-HA-ConfigSync",
+            "properties": {
+              "description": "Allow BIG-IP HA CMI ConfigSync and Device Trust on eth2 (TCP 4353, 443, 1026)",
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRanges": [
+                "4353",
+                "443",
+                "1026"
+              ],
+              "sourceAddressPrefix": "VirtualNetwork",
+              "destinationAddressPrefix": "VirtualNetwork",
+              "access": "Allow",
+              "priority": 100,
+              "direction": "Inbound"
+            }
+          },
+          {
+            "name": "Allow-BIGIP-HA-Heartbeat-UDP",
+            "properties": {
+              "description": "Allow BIG-IP HA network failover heartbeat on eth2 (UDP 1026)",
+              "protocol": "Udp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "1026",
+              "sourceAddressPrefix": "VirtualNetwork",
+              "destinationAddressPrefix": "VirtualNetwork",
+              "access": "Allow",
+              "priority": 110,
+              "direction": "Inbound"
+            }
+          },
+          {
+            "name": "Allow-Internal-VNet-Traffic",
+            "properties": {
+              "description": "Allow internal VNet traffic on eth2",
+              "protocol": "*",
+              "sourcePortRange": "*",
+              "destinationPortRange": "*",
+              "sourceAddressPrefix": "VirtualNetwork",
+              "destinationAddressPrefix": "VirtualNetwork",
+              "access": "Allow",
+              "priority": 120,
+              "direction": "Inbound"
+            }
+          },
+          {
+            "name": "Allow-AzureLoadBalancer-Internal",
+            "properties": {
+              "description": "Allow Azure Load Balancer health probes on eth2",
+              "protocol": "*",
+              "sourcePortRange": "*",
+              "destinationPortRange": "*",
+              "sourceAddressPrefix": "AzureLoadBalancer",
+              "destinationAddressPrefix": "*",
+              "access": "Allow",
+              "priority": 130,
+              "direction": "Inbound"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/virtualNetworks",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('vnetName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('mgmtNsgName'))]",
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('externalNsgName'))]",
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('internalNsgName'))]"
+      ],
+      "properties": {
+        "addressSpace": {
+          "addressPrefixes": [
+            "[parameters('vnetAddressPrefix')]"
+          ]
+        },
+        "subnets": [
+          {
+            "name": "[variables('mgmtSubnetName')]",
+            "properties": {
+              "addressPrefix": "[parameters('mgmtSubnetPrefix')]",
+              "networkSecurityGroup": {
+                "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('mgmtNsgName'))]"
+              }
+            }
+          },
+          {
+            "name": "[variables('externalSubnetName')]",
+            "properties": {
+              "addressPrefix": "[parameters('externalSubnetPrefix')]",
+              "networkSecurityGroup": {
+                "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('externalNsgName'))]"
+              }
+            }
+          },
+          {
+            "name": "[variables('internalSubnetName')]",
+            "properties": {
+              "addressPrefix": "[parameters('internalSubnetPrefix')]",
+              "networkSecurityGroup": {
+                "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('internalNsgName'))]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/publicIPAddresses",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('globalLbPipName')]",
+      "location": "[parameters('globalLbLocation')]",
+      "sku": {
+        "name": "Standard",
+        "tier": "Global"
+      },
+      "properties": {
+        "publicIPAllocationMethod": "Static",
+        "dnsSettings": {
+          "domainNameLabel": "[toLower(format('{0}-global-{1}', parameters('deploymentPrefix'), uniqueString(resourceGroup().id)))]"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Network/publicIPAddresses",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('externalLbPipName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard",
+        "tier": "Regional"
+      },
+      "properties": {
+        "publicIPAllocationMethod": "Static",
+        "dnsSettings": {
+          "domainNameLabel": "[toLower(format('{0}-regional-{1}', parameters('deploymentPrefix'), uniqueString(resourceGroup().id)))]"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Network/publicIPAddresses",
+      "apiVersion": "2023-05-01",
+      "name": "[format('{0}-vm{1}-eth0-mgmt-pip', parameters('deploymentPrefix'), add(copyIndex(), 1))]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard",
+        "tier": "Regional"
+      },
+      "copy": {
+        "name": "mgmtPipLoop",
+        "count": "[variables('vmCount')]"
+      },
+      "properties": {
+        "publicIPAllocationMethod": "Static",
+        "dnsSettings": {
+          "domainNameLabel": "[toLower(format('{0}-vm{1}-{2}', parameters('deploymentPrefix'), add(copyIndex(), 1), uniqueString(resourceGroup().id)))]"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Network/loadBalancers",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('externalLbName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard",
+        "tier": "Regional"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/publicIPAddresses', variables('externalLbPipName'))]"
+      ],
+      "properties": {
+        "frontendIPConfigurations": [
+          {
+            "name": "[variables('externalLbFrontendName')]",
+            "properties": {
+              "publicIPAddress": {
+                "id": "[resourceId('Microsoft.Network/publicIPAddresses', variables('externalLbPipName'))]"
+              }
+            }
+          }
+        ],
+        "backendAddressPools": [
+          {
+            "name": "[variables('externalLbBackendPoolName')]"
+          }
+        ],
+        "probes": [
+          {
+            "name": "[variables('externalLbProbeName')]",
+            "properties": {
+              "protocol": "Tcp",
+              "port": "[parameters('healthProbePort')]",
+              "intervalInSeconds": 5,
+              "numberOfProbes": 2
+            }
+          }
+        ],
+        "loadBalancingRules": [
+          {
+            "name": "Regional-External-HTTPS-Rule",
+            "properties": {
+              "frontendIPConfiguration": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/frontendIPConfigurations', variables('externalLbName'), variables('externalLbFrontendName'))]"
+              },
+              "backendAddressPool": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/backendAddressPools', variables('externalLbName'), variables('externalLbBackendPoolName'))]"
+              },
+              "probe": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/probes', variables('externalLbName'), variables('externalLbProbeName'))]"
+              },
+              "protocol": "Tcp",
+              "frontendPort": 443,
+              "backendPort": 443,
+              "enableFloatingIP": true,
+              "idleTimeoutInMinutes": 4,
+              "disableOutboundSnat": true
+            }
+          },
+          {
+            "name": "Regional-External-HTTP-Rule",
+            "properties": {
+              "frontendIPConfiguration": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/frontendIPConfigurations', variables('externalLbName'), variables('externalLbFrontendName'))]"
+              },
+              "backendAddressPool": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/backendAddressPools', variables('externalLbName'), variables('externalLbBackendPoolName'))]"
+              },
+              "probe": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/probes', variables('externalLbName'), variables('externalLbProbeName'))]"
+              },
+              "protocol": "Tcp",
+              "frontendPort": 80,
+              "backendPort": 80,
+              "enableFloatingIP": true,
+              "idleTimeoutInMinutes": 4,
+              "disableOutboundSnat": true
+            }
+          }
+        ],
+        "outboundRules": [
+          {
+            "name": "Regional-External-Outbound-SNAT",
+            "properties": {
+              "allocatedOutboundPorts": 1024,
+              "protocol": "All",
+              "enableTcpReset": true,
+              "idleTimeoutInMinutes": 4,
+              "backendAddressPool": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/backendAddressPools', variables('externalLbName'), variables('externalLbBackendPoolName'))]"
+              },
+              "frontendIPConfigurations": [
+                {
+                  "id": "[resourceId('Microsoft.Network/loadBalancers/frontendIPConfigurations', variables('externalLbName'), variables('externalLbFrontendName'))]"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/loadBalancers",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('globalLbName')]",
+      "location": "[parameters('globalLbLocation')]",
+      "sku": {
+        "name": "Standard",
+        "tier": "Global"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/publicIPAddresses', variables('globalLbPipName'))]",
+        "[resourceId('Microsoft.Network/loadBalancers', variables('externalLbName'))]"
+      ],
+      "properties": {
+        "frontendIPConfigurations": [
+          {
+            "name": "[variables('globalLbFrontendName')]",
+            "properties": {
+              "publicIPAddress": {
+                "id": "[resourceId('Microsoft.Network/publicIPAddresses', variables('globalLbPipName'))]"
+              }
+            }
+          }
+        ],
+        "backendAddressPools": [
+          {
+            "name": "[variables('globalLbBackendPoolName')]",
+            "properties": {
+              "loadBalancerBackendAddresses": [
+                {
+                  "name": "Region1-ExternalALB-Frontend",
+                  "properties": {
+                    "loadBalancerFrontendIPConfiguration": {
+                      "id": "[resourceId('Microsoft.Network/loadBalancers/frontendIPConfigurations', variables('externalLbName'), variables('externalLbFrontendName'))]"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "loadBalancingRules": [
+          {
+            "name": "Global-HTTPS-Rule",
+            "properties": {
+              "frontendIPConfiguration": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/frontendIPConfigurations', variables('globalLbName'), variables('globalLbFrontendName'))]"
+              },
+              "backendAddressPool": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/backendAddressPools', variables('globalLbName'), variables('globalLbBackendPoolName'))]"
+              },
+              "protocol": "Tcp",
+              "frontendPort": 443,
+              "backendPort": 443,
+              "enableFloatingIP": true
+            }
+          },
+          {
+            "name": "Global-HTTP-Rule",
+            "properties": {
+              "frontendIPConfiguration": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/frontendIPConfigurations', variables('globalLbName'), variables('globalLbFrontendName'))]"
+              },
+              "backendAddressPool": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/backendAddressPools', variables('globalLbName'), variables('globalLbBackendPoolName'))]"
+              },
+              "protocol": "Tcp",
+              "frontendPort": 80,
+              "backendPort": 80,
+              "enableFloatingIP": true
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/loadBalancers",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('internalLbName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard",
+        "tier": "Regional"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]"
+      ],
+      "properties": {
+        "frontendIPConfigurations": [
+          {
+            "name": "[variables('internalLbFrontendName')]",
+            "properties": {
+              "privateIPAllocationMethod": "Static",
+              "privateIPAddress": "[parameters('internalLbPrivateIp')]",
+              "subnet": {
+                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), variables('internalSubnetName'))]"
+              }
+            }
+          }
+        ],
+        "backendAddressPools": [
+          {
+            "name": "[variables('internalLbBackendPoolName')]"
+          }
+        ],
+        "probes": [
+          {
+            "name": "[variables('internalLbProbeName')]",
+            "properties": {
+              "protocol": "Tcp",
+              "port": "[parameters('healthProbePort')]",
+              "intervalInSeconds": 5,
+              "numberOfProbes": 2
+            }
+          }
+        ],
+        "loadBalancingRules": [
+          {
+            "name": "Regional-Internal-HAPorts-Rule",
+            "properties": {
+              "frontendIPConfiguration": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/frontendIPConfigurations', variables('internalLbName'), variables('internalLbFrontendName'))]"
+              },
+              "backendAddressPool": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/backendAddressPools', variables('internalLbName'), variables('internalLbBackendPoolName'))]"
+              },
+              "probe": {
+                "id": "[resourceId('Microsoft.Network/loadBalancers/probes', variables('internalLbName'), variables('internalLbProbeName'))]"
+              },
+              "protocol": "All",
+              "frontendPort": 0,
+              "backendPort": 0,
+              "enableFloatingIP": true,
+              "idleTimeoutInMinutes": 4
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "2023-05-01",
+      "name": "[format('{0}-vm{1}-eth0-mgmt-nic', parameters('deploymentPrefix'), add(copyIndex(), 1))]",
+      "location": "[parameters('location')]",
+      "copy": {
+        "name": "mgmtNicLoop",
+        "count": "[variables('vmCount')]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]",
+        "[resourceId('Microsoft.Network/publicIPAddresses', format('{0}-vm{1}-eth0-mgmt-pip', parameters('deploymentPrefix'), add(copyIndex(), 1)))]",
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('mgmtNsgName'))]"
+      ],
+      "properties": {
+        "enableIPForwarding": false,
+        "networkSecurityGroup": {
+          "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('mgmtNsgName'))]"
+        },
+        "ipConfigurations": [
+          {
+            "name": "eth0-mgmt-ipconfig",
+            "properties": {
+              "primary": true,
+              "privateIPAllocationMethod": "Dynamic",
+              "publicIPAddress": {
+                "id": "[resourceId('Microsoft.Network/publicIPAddresses', format('{0}-vm{1}-eth0-mgmt-pip', parameters('deploymentPrefix'), add(copyIndex(), 1)))]"
+              },
+              "subnet": {
+                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), variables('mgmtSubnetName'))]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "2023-05-01",
+      "name": "[format('{0}-vm{1}-eth1-ext-nic', parameters('deploymentPrefix'), add(copyIndex(), 1))]",
+      "location": "[parameters('location')]",
+      "copy": {
+        "name": "extNicLoop",
+        "count": "[variables('vmCount')]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]",
+        "[resourceId('Microsoft.Network/loadBalancers', variables('externalLbName'))]",
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('externalNsgName'))]"
+      ],
+      "properties": {
+        "enableIPForwarding": true,
+        "networkSecurityGroup": {
+          "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('externalNsgName'))]"
+        },
+        "ipConfigurations": [
+          {
+            "name": "eth1-ext-ipconfig",
+            "properties": {
+              "primary": true,
+              "privateIPAllocationMethod": "Dynamic",
+              "subnet": {
+                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), variables('externalSubnetName'))]"
+              },
+              "loadBalancerBackendAddressPools": [
+                {
+                  "id": "[resourceId('Microsoft.Network/loadBalancers/backendAddressPools', variables('externalLbName'), variables('externalLbBackendPoolName'))]"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "2023-05-01",
+      "name": "[format('{0}-vm{1}-eth2-int-nic', parameters('deploymentPrefix'), add(copyIndex(), 1))]",
+      "location": "[parameters('location')]",
+      "copy": {
+        "name": "intNicLoop",
+        "count": "[variables('vmCount')]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]",
+        "[resourceId('Microsoft.Network/loadBalancers', variables('internalLbName'))]",
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('internalNsgName'))]"
+      ],
+      "properties": {
+        "enableIPForwarding": true,
+        "networkSecurityGroup": {
+          "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('internalNsgName'))]"
+        },
+        "ipConfigurations": [
+          {
+            "name": "eth2-int-ipconfig",
+            "properties": {
+              "primary": true,
+              "privateIPAllocationMethod": "Dynamic",
+              "subnet": {
+                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), variables('internalSubnetName'))]"
+              },
+              "loadBalancerBackendAddressPools": [
+                {
+                  "id": "[resourceId('Microsoft.Network/loadBalancers/backendAddressPools', variables('internalLbName'), variables('internalLbBackendPoolName'))]"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Compute/virtualMachines",
+      "apiVersion": "2023-07-01",
+      "name": "[format('{0}-vm{1}', parameters('deploymentPrefix'), add(copyIndex(), 1))]",
+      "location": "[parameters('location')]",
+      "copy": {
+        "name": "vmLoop",
+        "count": "[variables('vmCount')]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Compute/availabilitySets', variables('avSetName'))]",
+        "[resourceId('Microsoft.Network/networkInterfaces', format('{0}-vm{1}-eth0-mgmt-nic', parameters('deploymentPrefix'), add(copyIndex(), 1)))]",
+        "[resourceId('Microsoft.Network/networkInterfaces', format('{0}-vm{1}-eth1-ext-nic', parameters('deploymentPrefix'), add(copyIndex(), 1)))]",
+        "[resourceId('Microsoft.Network/networkInterfaces', format('{0}-vm{1}-eth2-int-nic', parameters('deploymentPrefix'), add(copyIndex(), 1)))]"
+      ],
+      "plan": {
+        "name": "[parameters('imageSku')]",
+        "publisher": "f5-networks",
+        "product": "[parameters('imageOffer')]"
+      },
+      "properties": {
+        "availabilitySet": {
+          "id": "[resourceId('Microsoft.Compute/availabilitySets', variables('avSetName'))]"
+        },
+        "hardwareProfile": {
+          "vmSize": "[parameters('vmSize')]"
+        },
+        "osProfile": {
+          "computerName": "[format('{0}-vm{1}', parameters('deploymentPrefix'), add(copyIndex(), 1))]",
+          "adminUsername": "[parameters('adminUsername')]",
+          "adminPassword": "[parameters('adminPasswordOrKey')]",
+          "linuxConfiguration": "[if(equals(parameters('authenticationType'), 'password'), null(), variables('linuxConfiguration'))]"
+        },
+        "storageProfile": {
+          "imageReference": {
+            "publisher": "f5-networks",
+            "offer": "[parameters('imageOffer')]",
+            "sku": "[parameters('imageSku')]",
+            "version": "[parameters('bigipVersion')]"
+          },
+          "osDisk": {
+            "createOption": "FromImage",
+            "managedDisk": {
+              "storageAccountType": "Premium_LRS"
+            }
+          }
+        },
+        "networkProfile": {
+          "networkInterfaces": [
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', format('{0}-vm{1}-eth0-mgmt-nic', parameters('deploymentPrefix'), add(copyIndex(), 1)))]",
+              "properties": {
+                "primary": true
+              }
+            },
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', format('{0}-vm{1}-eth1-ext-nic', parameters('deploymentPrefix'), add(copyIndex(), 1)))]",
+              "properties": {
+                "primary": false
+              }
+            },
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', format('{0}-vm{1}-eth2-int-nic', parameters('deploymentPrefix'), add(copyIndex(), 1)))]",
+              "properties": {
+                "primary": false
+              }
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "globalAnycastPublicIp": {
+      "type": "string",
+      "value": "[reference(variables('globalLbPipName')).ipAddress]"
+    },
+    "globalAnycastFqdn": {
+      "type": "string",
+      "value": "[reference(variables('globalLbPipName')).dnsSettings.fqdn]"
+    },
+    "regionalExternalAlbPublicIp": {
+      "type": "string",
+      "value": "[reference(variables('externalLbPipName')).ipAddress]"
+    },
+    "regionalInternalAlbPrivateIp": {
+      "type": "string",
+      "value": "[parameters('internalLbPrivateIp')]"
+    },
+    "bigip1MgmtGuiUrl": {
+      "type": "string",
+      "value": "[format('https://{0}', reference(format('{0}-vm1-eth0-mgmt-pip', parameters('deploymentPrefix'))).dnsSettings.fqdn)]"
+    },
+    "bigip2MgmtGuiUrl": {
+      "type": "string",
+      "value": "[format('https://{0}', reference(format('{0}-vm2-eth0-mgmt-pip', parameters('deploymentPrefix'))).dnsSettings.fqdn)]"
+    }
+  }
+}
